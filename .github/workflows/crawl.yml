@@ -1,0 +1,120 @@
+name: Rastreo de comandantes
+
+# Corre aquí, en el repo público, porque los minutos de Actions son gratis en repos públicos
+# y el rastreo dura horas. Compila el crawler desde el repo privado de la app con una deploy key
+# de solo lectura (secret COMMANDECK_APP_KEY) y publica en este mismo repo con el token del job.
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 04:00 en Madrid en verano, 03:00 en invierno
+  workflow_dispatch:
+    inputs:
+      decks:
+        description: "Mazos por comandante"
+        default: "150"
+      top:
+        description: "Cuántos comandantes del ranking entran en la lista"
+        default: "1300"
+      minutes:
+        description: "Minutos de rastreo antes de publicar lo que haya"
+        default: "330"
+      top_tier:
+        description: "Tamaño del escalón alto del ranking"
+        default: "300"
+      top_max_age:
+        description: "Días que vale un fichero del escalón alto"
+        default: "7"
+      max_age:
+        description: "Días que vale un fichero del resto del ranking (0 = todo)"
+        default: "21"
+      showcase_max_age:
+        description: "Días que vale un fichero de las listas de novedades"
+        default: "3"
+
+env:
+  DECKS: ${{ github.event.inputs.decks || '150' }}
+  TOP: ${{ github.event.inputs.top || '1300' }}
+  MINUTES: ${{ github.event.inputs.minutes || '330' }}
+  TOP_TIER: ${{ github.event.inputs.top_tier || '300' }}
+  TOP_MAX_AGE: ${{ github.event.inputs.top_max_age || '7' }}
+  MAX_AGE: ${{ github.event.inputs.max_age || '21' }}
+  SHOWCASE_MAX_AGE: ${{ github.event.inputs.showcase_max_age || '3' }}
+
+# Nunca dos rastreos a la vez: el segundo espera a que acabe el primero.
+concurrency:
+  group: rastreo
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout de los datos
+        uses: actions/checkout@v4
+        with:
+          path: datos
+
+      - name: Checkout de la app (solo lectura)
+        uses: actions/checkout@v4
+        with:
+          repository: davidferrandiz/commandeck
+          path: app
+          ssh-key: ${{ secrets.COMMANDECK_APP_KEY }}
+
+      - name: Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Lista de comandantes desde el ranking publicado
+        env:
+          DATA_DIR: datos
+        run: |
+          python3 app/tools/commander-list.py
+          test -s comandantes.txt || cp app/comandantes.txt comandantes.txt
+          echo "$(wc -l < comandantes.txt) comandantes en la lista"
+
+      - name: Compilar el crawler
+        working-directory: app
+        run: ./gradlew :tools:crawler:installDist --no-daemon
+
+      - name: Rastrear
+        run: |
+          app/tools/crawler/build/install/crawler/bin/crawler \
+            comandantes.txt datos \
+            "$DECKS" "$MINUTES" "$MAX_AGE" "$TOP_TIER" "$TOP_MAX_AGE" "$SHOWCASE_MAX_AGE" \
+            2>&1 | tee rastreo.log
+
+      - name: Guardar el log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rastreo-${{ github.run_id }}
+          path: rastreo.log
+          retention-days: 14
+
+      - name: Publicar
+        working-directory: datos
+        run: |
+          git config user.name "commandeck-crawler"
+          git config user.email "ferry.applications@gmail.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "nada nuevo que subir"
+            exit 0
+          fi
+          NUEVOS=$(git diff --staged --name-only | wc -l | tr -d ' ')
+          git commit -m "Rastreo $(date +%Y-%m-%d): $NUEVOS ficheros"
+          # Si hubo un rastreo manual mientras tanto, se rebasa; en conflicto gana el de hoy.
+          git pull --rebase -X theirs origin main
+          git push
+          echo "subidos $NUEVOS ficheros"
