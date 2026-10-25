@@ -94,6 +94,12 @@ jobs:
             "$DECKS" "$MINUTES" "$MAX_AGE" "$TOP_TIER" "$TOP_MAX_AGE" "$SHOWCASE_MAX_AGE" \
             2>&1 | tee rastreo.log
 
+      - name: Índice de "Build from your collection"
+        # Lee los ficheros de comandante ya en datos/ (los de hoy y los anteriores) y
+        # los precios del bulk de Scryfall. Si Scryfall falla, se conserva el índice anterior.
+        run: |
+          app/tools/crawler/build/install/crawler/bin/crawler index datos 2>&1 | tee -a rastreo.log
+
       - name: Guardar el log
         if: always()
         uses: actions/upload-artifact@v4
