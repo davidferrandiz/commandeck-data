@@ -2,7 +2,12 @@ name: Rastreo de comandantes
 
 # Corre aquí, en el repo público, porque los minutos de Actions son gratis en repos públicos
 # y el rastreo dura horas. Compila el crawler desde el repo privado de la app con una deploy key
-# de solo lectura (secret COMMANDECK_APP_KEY) y publica en este mismo repo con el token del job.
+# de solo lectura (secret COMMANDECK_APP_KEY).
+#
+# Desde K69 los datos ya no se suben con un commit diario: se publican en Pages con
+# deploy-pages (Settings → Pages → Source: GitHub Actions) y el estado entre noches vive en la
+# caché de Actions. El historial dejó de crecer (eran ~300 MB de packs). Si la caché se pierde,
+# se parte de lo último que hay en la rama main, y el rastreo escalonado lo pone al día.
 
 on:
   schedule:
@@ -13,11 +18,11 @@ on:
         description: "Mazos por comandante"
         default: "150"
       top:
-        description: "Cuántos comandantes del ranking entran en la lista"
-        default: "1300"
+        description: "Cuántos comandantes de crawl-list.json entran en la lista (los 1300 de playgroup y luego los que añade EDHREC)"
+        default: "2000"
       minutes:
         description: "Minutos de rastreo antes de publicar lo que haya"
-        default: "330"
+        default: "315"
       top_tier:
         description: "Tamaño del escalón alto del ranking"
         default: "300"
@@ -33,8 +38,8 @@ on:
 
 env:
   DECKS: ${{ github.event.inputs.decks || '150' }}
-  TOP: ${{ github.event.inputs.top || '1300' }}
-  MINUTES: ${{ github.event.inputs.minutes || '330' }}
+  TOP: ${{ github.event.inputs.top || '2000' }}
+  MINUTES: ${{ github.event.inputs.minutes || '315' }}
   TOP_TIER: ${{ github.event.inputs.top_tier || '300' }}
   TOP_MAX_AGE: ${{ github.event.inputs.top_max_age || '7' }}
   MAX_AGE: ${{ github.event.inputs.max_age || '21' }}
@@ -46,19 +51,19 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
 
     steps:
-      - name: Checkout de los datos
-        uses: actions/checkout@v4
-        with:
-          path: datos
-
       - name: Checkout de la app (solo lectura)
         uses: actions/checkout@v4
         with:
@@ -75,6 +80,38 @@ jobs:
       - name: Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # Aquí y no en el CI de la app: en un repo público no cuesta minutos, y un crawler
+      # roto no llega a rastrear ni a publicar nada.
+      - name: Tests del crawler
+        working-directory: app
+        run: ./gradlew :tools:crawler:test --no-daemon
+
+      - name: Datos de anoche
+        id: datos
+        uses: actions/cache/restore@v4
+        with:
+          path: datos
+          key: datos-${{ github.run_id }}
+          restore-keys: datos-
+
+      # Solo la primera vez, o si la caché se perdió: lo último que se subió a main.
+      - name: Datos de main (sin caché)
+        if: steps.datos.outputs.cache-matched-key == ''
+        uses: actions/checkout@v4
+        with:
+          path: datos
+
+      - name: Quitar el git de los datos
+        if: steps.datos.outputs.cache-matched-key == ''
+        run: rm -rf datos/.git datos/.github
+
+      - name: Caché de mazos
+        uses: actions/cache/restore@v4
+        with:
+          path: mazos.json.gz
+          key: mazos-${{ github.run_id }}
+          restore-keys: mazos-
+
       - name: Lista de comandantes desde el ranking publicado
         env:
           DATA_DIR: datos
@@ -87,7 +124,13 @@ jobs:
         working-directory: app
         run: ./gradlew :tools:crawler:installDist --no-daemon
 
+      # Un fichero que no se pudo refrescar hace que el crawler acabe con error, pero lo que
+      # sí salió se publica igual: el paso final es el que marca el run en rojo y manda el correo.
       - name: Rastrear
+        id: rastreo
+        continue-on-error: true
+        env:
+          COMMANDECK_DECK_CACHE: ${{ github.workspace }}/mazos.json.gz
         run: |
           app/tools/crawler/build/install/crawler/bin/crawler \
             comandantes.txt datos \
@@ -97,8 +140,24 @@ jobs:
       - name: Índice de "Build from your collection"
         # Lee los ficheros de comandante ya en datos/ (los de hoy y los anteriores) y
         # los precios del bulk de Scryfall. Si Scryfall falla, se conserva el índice anterior.
+        id: indice
+        continue-on-error: true
         run: |
           app/tools/crawler/build/install/crawler/bin/crawler index datos 2>&1 | tee -a rastreo.log
+
+      - name: Guardar la caché de mazos
+        if: always() && hashFiles('mazos.json.gz') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: mazos.json.gz
+          key: mazos-${{ github.run_id }}
+
+      - name: Guardar los datos para mañana
+        if: always() && hashFiles('datos/commanders.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: datos
+          key: datos-${{ github.run_id }}
 
       - name: Guardar el log
         if: always()
@@ -108,19 +167,22 @@ jobs:
           path: rastreo.log
           retention-days: 14
 
-      - name: Publicar
-        working-directory: datos
+      - name: Preparar la web
         run: |
-          git config user.name "commandeck-crawler"
-          git config user.email "ferry.applications@gmail.com"
-          git add -A
-          if git diff --staged --quiet; then
-            echo "nada nuevo que subir"
-            exit 0
-          fi
-          NUEVOS=$(git diff --staged --name-only | wc -l | tr -d ' ')
-          git commit -m "Rastreo $(date +%Y-%m-%d): $NUEVOS ficheros"
-          # Si hubo un rastreo manual mientras tanto, se rebasa; en conflicto gana el de hoy.
-          git pull --rebase -X theirs origin main
-          git push
-          echo "subidos $NUEVOS ficheros"
+          touch datos/.nojekyll
+          echo "$(find datos -type f | wc -l) ficheros, $(du -sh datos | cut -f1)"
+
+      - name: Subir la web
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: datos
+
+      - name: Publicar
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Avisar si algo no se refrescó
+        if: steps.rastreo.outcome == 'failure' || steps.indice.outcome == 'failure'
+        run: |
+          echo "::error::Algún fichero se quedó como estaba: mira el resumen del run."
+          exit 1
